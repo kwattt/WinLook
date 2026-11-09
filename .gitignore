@@ -1,0 +1,23 @@
+# Rust & Cargo build artifacts
+/target/
+/dist/
+**/*.rs.bk
+*.pdb
+*.exe
+*.msi
+*.zip
+
+# Environment & Local Secrets
+.env
+.env.*
+!.env.example
+config.json
+
+# IDE & OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store
