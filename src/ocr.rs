@@ -16,8 +16,8 @@ impl BoundingBox {
     pub fn intersects(&self, rect: &ScreenRect) -> bool {
         let rx1 = rect.x as f32;
         let ry1 = rect.y as f32;
-        let rx2 = (rect.x + rect.width) as f32;
-        let ry2 = (rect.y + rect.height) as f32;
+        let rx2 = (rect.x as f32) + (rect.width as f32);
+        let ry2 = (rect.y as f32) + (rect.height as f32);
 
         let bx1 = self.x;
         let by1 = self.y;
@@ -32,13 +32,13 @@ impl BoundingBox {
 
     /// Converts this bounding box into a padded physical `ScreenRect`.
     pub fn to_screen_rect(&self, pad: u32, max_w: u32, max_h: u32) -> ScreenRect {
-        let x = (self.x.floor() as u32).saturating_sub(pad);
-        let y = (self.y.floor() as u32).saturating_sub(pad);
+        let x = (self.x.floor() as i32).saturating_sub(pad as i32).max(0);
+        let y = (self.y.floor() as i32).saturating_sub(pad as i32).max(0);
         let w = ((self.width.ceil() as u32) + pad * 2)
-            .min(max_w.saturating_sub(x))
+            .min(max_w.saturating_sub(x as u32))
             .max(1);
         let h = ((self.height.ceil() as u32) + pad * 2)
-            .min(max_h.saturating_sub(y))
+            .min(max_h.saturating_sub(y as u32))
             .max(1);
         ScreenRect {
             x,

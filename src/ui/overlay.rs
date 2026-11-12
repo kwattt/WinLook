@@ -798,55 +798,71 @@ impl Render for OverlayView {
                     })
                     .when_some(selection, |canvas, sel| {
                         let (sx, sy, sw, sh) = sel.to_logical(scale);
-                        let right_x = (sx + sw).min(lw);
-                        let bottom_y = (sy + sh).min(lh);
-                        let tag_y = if sy >= 22.0 { sy - 20.0 } else { sy + 4.0 };
+                        let sel_left = sx.clamp(0.0, lw);
+                        let sel_top = sy.clamp(0.0, lh);
+                        let sel_right = (sx + sw).clamp(sel_left, lw);
+                        let sel_bottom = (sy + sh).clamp(sel_top, lh);
+                        let sel_w = sel_right - sel_left;
+                        let sel_h = sel_bottom - sel_top;
+
+                        let tag_x = sel_left.clamp(4.0, (lw - 90.0).max(4.0));
+                        let tag_y = if sel_top >= 24.0 {
+                            sel_top - 22.0
+                        } else if sel_bottom + 24.0 <= lh {
+                            sel_top + 4.0
+                        } else {
+                            (lh - 24.0).max(4.0)
+                        };
 
                         canvas
+                            // 1. Top scrim rectangle
                             .child(
                                 div()
                                     .absolute()
                                     .left(px(0.0))
                                     .top(px(0.0))
                                     .w(px(lw))
-                                    .h(px(sy.max(0.0)))
+                                    .h(px(sel_top))
                                     .bg(rgba(0x00000078)),
                             )
+                            // 2. Bottom scrim rectangle
                             .child(
                                 div()
                                     .absolute()
                                     .left(px(0.0))
-                                    .top(px(bottom_y))
+                                    .top(px(sel_bottom))
                                     .w(px(lw))
-                                    .h(px((lh - bottom_y).max(0.0)))
+                                    .h(px(lh - sel_bottom))
                                     .bg(rgba(0x00000078)),
                             )
+                            // 3. Left scrim rectangle
                             .child(
                                 div()
                                     .absolute()
                                     .left(px(0.0))
-                                    .top(px(sy))
-                                    .w(px(sx.max(0.0)))
-                                    .h(px(sh))
+                                    .top(px(sel_top))
+                                    .w(px(sel_left))
+                                    .h(px(sel_h))
                                     .bg(rgba(0x00000078)),
                             )
+                            // 4. Right scrim rectangle
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px(right_x))
-                                    .top(px(sy))
-                                    .w(px((lw - right_x).max(0.0)))
-                                    .h(px(sh))
+                                    .left(px(sel_right))
+                                    .top(px(sel_top))
+                                    .w(px(lw - sel_right))
+                                    .h(px(sel_h))
                                     .bg(rgba(0x00000078)),
                             )
                             // Neutral 1px selection outline
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px(sx))
-                                    .top(px(sy))
-                                    .w(px(sw))
-                                    .h(px(sh))
+                                    .left(px(sel_left))
+                                    .top(px(sel_top))
+                                    .w(px(sel_w))
+                                    .h(px(sel_h))
                                     .border_1()
                                     .border_color(rgb(SELECTION_STROKE)),
                             )
@@ -854,7 +870,7 @@ impl Render for OverlayView {
                             .child(
                                 div()
                                     .absolute()
-                                    .left(px(sx))
+                                    .left(px(tag_x))
                                     .top(px(tag_y))
                                     .px_1p5()
                                     .py_0p5()

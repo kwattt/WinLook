@@ -1,4 +1,4 @@
-use crate::capture::copy_text_to_clipboard;
+use crate::capture::{ScreenRect, copy_text_to_clipboard};
 use crate::ui::overlay::OverlayView;
 use crate::ui::{
     BG_INPUT, BG_SURFACE, BG_WINDOW, BORDER_LINE, OverlayMode, TEXT_DIM, TEXT_MAIN, TEXT_SUB,
@@ -14,6 +14,65 @@ use gpui_component::input::Input;
 use gpui_component::text::TextView;
 use gpui_component::{h_flex, v_flex};
 
+/// Computes the clamped floating toolbar position (anchor_x, anchor_y)
+/// constrained within the active monitor's work area, preventing rendering in dead zones.
+#[allow(clippy::too_many_arguments)]
+pub fn calculate_toolbar_position(
+    sel: ScreenRect,
+    scale: f32,
+    dock_width: f32,
+    needed_height: f32,
+    monitors: &[crate::capture::MonitorInfo],
+    vx: i32,
+    vy: i32,
+    fallback_lw: f32,
+    fallback_lh: f32,
+) -> (f32, f32) {
+    let s = if scale <= 0.0 { 1.0 } else { scale };
+    let (sx, sy, _sw, sh) = sel.to_logical(s);
+
+    // Find the monitor that has the greatest intersection with the selection,
+    // or contains the selection center / top-left, or fallback to primary monitor.
+    let active_monitor = monitors
+        .iter()
+        .max_by_key(|m| {
+            let buf_rect = m.buffer_rect(vx, vy);
+            buf_rect.intersection_area(&sel)
+        })
+        .filter(|m| {
+            let buf_rect = m.buffer_rect(vx, vy);
+            buf_rect.intersects(&sel)
+        })
+        .or_else(|| {
+            let center_x = sel.x + (sel.width / 2) as i32;
+            let center_y = sel.y + (sel.height / 2) as i32;
+            monitors.iter().find(|m| m.contains_buffer_point(center_x, center_y, vx, vy))
+        })
+        .or_else(|| monitors.iter().find(|m| m.is_primary))
+        .or_else(|| monitors.first());
+
+    let (min_x, max_x, min_y, max_y) = if let Some(m) = active_monitor {
+        let work = m.buffer_work_rect(vx, vy);
+        let (wx, wy, ww, wh) = work.to_logical(s);
+        (wx, wx + ww, wy, wy + wh)
+    } else {
+        (0.0, fallback_lw, 0.0, fallback_lh)
+    };
+
+    let anchor_x = sx.clamp(min_x + 12.0, (max_x - dock_width - 12.0).max(min_x + 12.0));
+
+    let space_below = max_y - (sy + sh);
+    let anchor_y = if space_below >= needed_height + 12.0 {
+        sy + sh + 6.0
+    } else if sy - min_y >= needed_height + 36.0 {
+        (sy - needed_height - 6.0).max(min_y + 36.0)
+    } else {
+        (max_y - needed_height - 12.0).max(min_y + 36.0)
+    };
+
+    (anchor_x, anchor_y)
+}
+
 /// Renders the selection toolbar, automatic OCR text readout, and DeepSeek response panel.
 pub fn render_floating_inspector(
     view: &OverlayView,
@@ -24,21 +83,17 @@ pub fn render_floating_inspector(
     let lw = view.frame.logical_width();
     let lh = view.frame.logical_height();
 
-    let (sx, sy, _sw, sh) = sel.to_logical(scale);
-
     let extracted_text = view.state.auto_ocr_text.clone();
     let has_ocr_text = !extracted_text.trim().is_empty();
     let has_ai_key = crate::config::AppConfig::has_deepseek_api_key();
     let reasoning_on = view.config.enable_ai_reasoning;
 
     let dock_width = if has_ai_key { 640.0_f32 } else { 360.0_f32 };
-    let anchor_x = sx.clamp(12.0, (lw - dock_width - 12.0).max(12.0));
 
     let has_ai_drawer = view.state.mode == OverlayMode::AskDeepSeek
         && (!view.state.ai_markdown_response.is_empty() || view.state.is_loading);
     let show_ocr_drawer = view.state.show_ocr_panel && has_ocr_text && !has_ai_drawer;
 
-    let space_below = lh - (sy + sh);
     let needed_height = if has_ai_drawer {
         280.0
     } else if show_ocr_drawer {
@@ -47,13 +102,17 @@ pub fn render_floating_inspector(
         44.0
     };
 
-    let anchor_y = if space_below >= needed_height + 12.0 {
-        sy + sh + 6.0
-    } else if sy >= needed_height + 36.0 {
-        (sy - needed_height - 6.0).max(36.0)
-    } else {
-        (lh - needed_height - 12.0).max(36.0)
-    };
+    let (anchor_x, anchor_y) = calculate_toolbar_position(
+        sel,
+        scale,
+        dock_width,
+        needed_height,
+        &view.frame.monitors,
+        view.frame.vx,
+        view.frame.vy,
+        lw,
+        lh,
+    );
 
     let is_translating = view.state.mode == OverlayMode::InPlaceTranslate;
     let is_asking = view.state.is_loading && view.state.mode == OverlayMode::AskDeepSeek;
@@ -334,4 +393,140 @@ pub fn render_floating_inspector(
                     )
                 }),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capture::{MonitorInfo, ScreenRect};
+
+    #[test]
+    fn test_inspector_toolbar_clamping_multi_monitor() {
+        // Topology: Primary monitor (1920x1080) at (0, 0)
+        // Secondary monitor (1920x1080) at (-1920, 0)
+        // Virtual desktop: vx = -1920, vy = 0, vw = 3840, vh = 1080
+        let vx = -1920;
+        let vy = 0;
+        let scale = 1.0;
+        let dock_width = 360.0;
+        let needed_height = 44.0;
+
+        let monitors = vec![
+            MonitorInfo {
+                rect: ScreenRect { x: -1920, y: 0, width: 1920, height: 1080 },
+                work_rect: ScreenRect { x: -1920, y: 0, width: 1920, height: 1040 }, // 40px taskbar at bottom
+                is_primary: false,
+                scale_factor: 1.0,
+            },
+            MonitorInfo {
+                rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1080 },
+                work_rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1040 },
+                is_primary: true,
+                scale_factor: 1.0,
+            },
+        ];
+
+        // Selection completely on secondary monitor: in buffer coordinates [100, 100, 400, 300]
+        // (maps to virtual [-1820, 100, 400, 300])
+        let sel_sec = ScreenRect { x: 100, y: 100, width: 400, height: 300 };
+        let (ax, ay) = calculate_toolbar_position(
+            sel_sec,
+            scale,
+            dock_width,
+            needed_height,
+            &monitors,
+            vx,
+            vy,
+            3840.0,
+            1080.0,
+        );
+        // Secondary buffer work area is [0..1920, 0..1040]
+        assert!(ax >= 12.0 && ax + dock_width <= 1920.0 - 12.0);
+        assert_eq!(ax, 100.0);
+        assert_eq!(ay, 406.0); // 100 + 300 + 6 = 406
+
+        // Selection near bottom of secondary monitor, toolbar should fit above or inside work area (not in taskbar)
+        let sel_bot = ScreenRect { x: 100, y: 800, width: 400, height: 230 };
+        let (_ax2, ay2) = calculate_toolbar_position(
+            sel_bot,
+            scale,
+            dock_width,
+            needed_height,
+            &monitors,
+            vx,
+            vy,
+            3840.0,
+            1080.0,
+        );
+        // Space below is 1040 - (800 + 230) = 10, not enough for 44 + 12 = 56
+        // So it flips above: 800 - 44 - 6 = 750
+        assert_eq!(ay2, 750.0);
+
+        // Selection on primary monitor: in buffer coordinates [2000, 100, 400, 300]
+        // Primary buffer work area is [1920..3840, 0..1040]
+        let sel_prim = ScreenRect { x: 2000, y: 100, width: 400, height: 300 };
+        let (p_ax, _p_ay) = calculate_toolbar_position(
+            sel_prim,
+            scale,
+            dock_width,
+            needed_height,
+            &monitors,
+            vx,
+            vy,
+            3840.0,
+            1080.0,
+        );
+        assert!(p_ax >= 1920.0 + 12.0 && p_ax + dock_width <= 3840.0 - 12.0);
+        assert_eq!(p_ax, 2000.0);
+    }
+
+    #[test]
+    fn test_inspector_toolbar_clamping_l_shaped_avoid_dead_zone() {
+        // Topology: L-shaped setup
+        // Monitor 1 (primary): 1920x1080 at (0, 0)
+        // Monitor 2 (vertical secondary): 1080x1920 at (1920, 0)
+        // Virtual desktop: vx = 0, vy = 0, vw = 3000, vh = 1920
+        // Dead zone is at [0..1920, 1080..1920] (below monitor 1)
+        let vx = 0;
+        let vy = 0;
+        let scale = 1.0;
+        let dock_width = 360.0;
+        let needed_height = 50.0;
+
+        let monitors = vec![
+            MonitorInfo {
+                rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1080 },
+                work_rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1040 },
+                is_primary: true,
+                scale_factor: 1.0,
+            },
+            MonitorInfo {
+                rect: ScreenRect { x: 1920, y: 0, width: 1080, height: 1920 },
+                work_rect: ScreenRect { x: 1920, y: 0, width: 1080, height: 1880 },
+                is_primary: false,
+                scale_factor: 1.0,
+            },
+        ];
+
+        // Selection near bottom of monitor 1: sy = 1000, sh = 35 -> bottom = 1035
+        // Global virtual lh is 1920, so unconstrained clamping would think space_below = 1920 - 1035 = 885
+        // and place toolbar at 1041, which is in the dead zone!
+        // But with monitor work area clamping (max_y = 1040), space_below = 1040 - 1035 = 5.
+        // It flips above: 1000 - 50 - 6 = 944!
+        let sel = ScreenRect { x: 500, y: 1000, width: 300, height: 35 };
+        let (ax, ay) = calculate_toolbar_position(
+            sel,
+            scale,
+            dock_width,
+            needed_height,
+            &monitors,
+            vx,
+            vy,
+            3000.0,
+            1920.0,
+        );
+        assert_eq!(ax, 500.0);
+        assert_eq!(ay, 944.0);
+        assert!(ay + needed_height <= 1040.0);
+    }
 }

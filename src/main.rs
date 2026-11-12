@@ -5,6 +5,7 @@ pub mod config;
 pub mod ocr;
 pub mod services;
 pub mod ui;
+pub mod updater;
 
 use anyhow::Result;
 use config::AppConfig;
@@ -26,6 +27,7 @@ enum DaemonCommand {
     TakeFullscreenScreenshot,
     OpenScreenshotsFolder,
     OpenSettings,
+    CheckForUpdates,
     ReloadHotkey(String),
     Quit,
 }
@@ -86,7 +88,7 @@ fn trigger_capture(cx: &mut gpui::App, tx: mpsc::UnboundedSender<DaemonCommand>)
     close_all_windows(cx);
 
     let config = AppConfig::load();
-    match capture::capture_primary_screen() {
+    match capture::capture_virtual_screen() {
         Ok(frame) => {
             if let Err(err) = ui::open_overlay_window(cx, frame, config, move |new_hk| {
                 let _ = tx.send(DaemonCommand::ReloadHotkey(new_hk));
@@ -102,7 +104,7 @@ fn trigger_capture(cx: &mut gpui::App, tx: mpsc::UnboundedSender<DaemonCommand>)
 
 fn trigger_fullscreen_screenshot() {
     let config = AppConfig::load();
-    match capture::capture_primary_screen() {
+    match capture::capture_virtual_screen() {
         Ok(frame) => {
             let rect = frame.full_rect();
             match frame.save_crop_to_disk(rect, &config) {
@@ -138,6 +140,9 @@ fn trigger_open_settings(cx: &mut gpui::App, tx: mpsc::UnboundedSender<DaemonCom
 }
 
 fn main() -> Result<()> {
+    // Enable Windows Per-Monitor DPI awareness V2 early before GPUI or window initialization
+    capture::init_dpi_awareness();
+
     // Immediately heal any desktop windows that may have had WS_POPUP + WS_EX_TOPMOST applied
     ui::restore_accidentally_locked_windows();
 
@@ -198,12 +203,14 @@ fn main() -> Result<()> {
         );
         let item_screenshot = MenuItem::new("Fullscreen Screenshot", true, None);
         let item_open_folder = MenuItem::new("Open Screenshots Folder", true, None);
+        let item_check_updates = MenuItem::new("Check for Updates...", true, None);
         let item_settings = MenuItem::new("Preferences...", true, None);
         let item_quit = MenuItem::new("Quit WinLook", true, None);
 
         let capture_id = item_capture.id().clone();
         let screenshot_id = item_screenshot.id().clone();
         let open_folder_id = item_open_folder.id().clone();
+        let check_updates_id = item_check_updates.id().clone();
         let settings_id = item_settings.id().clone();
         let quit_id = item_quit.id().clone();
 
@@ -211,6 +218,7 @@ fn main() -> Result<()> {
         let _ = tray_menu.append(&item_screenshot);
         let _ = tray_menu.append(&item_open_folder);
         let _ = tray_menu.append(&PredefinedMenuItem::separator());
+        let _ = tray_menu.append(&item_check_updates);
         let _ = tray_menu.append(&item_settings);
         let _ = tray_menu.append(&PredefinedMenuItem::separator());
         let _ = tray_menu.append(&item_quit);
@@ -239,12 +247,29 @@ fn main() -> Result<()> {
                 let _ = tx_menu.send(DaemonCommand::TakeFullscreenScreenshot);
             } else if event.id == open_folder_id {
                 let _ = tx_menu.send(DaemonCommand::OpenScreenshotsFolder);
+            } else if event.id == check_updates_id {
+                let _ = tx_menu.send(DaemonCommand::CheckForUpdates);
             } else if event.id == settings_id {
                 let _ = tx_menu.send(DaemonCommand::OpenSettings);
             } else if event.id == quit_id {
                 let _ = tx_menu.send(DaemonCommand::Quit);
             }
         }));
+
+        // Background startup update check if configured
+        if config.check_updates_on_startup {
+            let tx_startup = tx.clone();
+            let cfg_clone = config.clone();
+            crate::ui::overlay::tokio_runtime().spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                let client = crate::updater::GitHubUpdaterClient::from_config(&cfg_clone);
+                let res = client.check_for_updates().await;
+                if let crate::updater::UpdateStatus::Available(_) = &res.status {
+                    crate::ui::settings::set_pending_update_result(res);
+                    let _ = tx_startup.send(DaemonCommand::OpenSettings);
+                }
+            });
+        }
 
         // 3. Startup Window Behavior
         if capture_on_start {
@@ -276,6 +301,13 @@ fn main() -> Result<()> {
                         }
                     }
                     DaemonCommand::OpenSettings => {
+                        let tx_s = tx_loop.clone();
+                        cx.update(|cx| {
+                            trigger_open_settings(cx, tx_s);
+                        });
+                    }
+                    DaemonCommand::CheckForUpdates => {
+                        crate::ui::settings::request_update_check_on_next_open();
                         let tx_s = tx_loop.clone();
                         cx.update(|cx| {
                             trigger_open_settings(cx, tx_s);

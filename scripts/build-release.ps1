@@ -22,16 +22,18 @@ $isccCandidates = @(
 $iscc = $isccCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 
 if ($iscc) {
+    $cargoToml = Get-Content (Join-Path $PSScriptRoot "..\Cargo.toml") -Raw
+    $version = if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $Matches[1] } else { "0.1.0" }
     Write-Host "==> Found Inno Setup at: $iscc"
-    Write-Host "==> Packaging Windows installer with Inno Setup..."
-    & $iscc (Join-Path $PSScriptRoot "..\installer\winlook.iss")
+    Write-Host "==> Packaging Windows installer v$version with Inno Setup..."
+    & $iscc "/DMyAppVersion=$version" (Join-Path $PSScriptRoot "..\installer\winlook.iss")
     if ($LASTEXITCODE -ne 0) {
         throw "ISCC.exe failed with exit code $LASTEXITCODE"
     }
-    $installerOut = Join-Path $PSScriptRoot "..\target\installer\WinLook-Setup-0.1.0-x64.exe"
+    $installerOut = Join-Path $PSScriptRoot "..\target\installer\WinLook-Setup-$version-x64.exe"
     if (Test-Path $installerOut) {
         $instMb = [math]::Round((Get-Item $installerOut).Length / 1MB, 2)
-        Write-Host "==> Success! Installer created at: target\installer\WinLook-Setup-0.1.0-x64.exe ($instMb MB)"
+        Write-Host "==> Success! Installer created at: target\installer\WinLook-Setup-$version-x64.exe ($instMb MB)"
     }
 } else {
     Write-Host "==> Note: Install Inno Setup 6 (winget install JRSoftware.InnoSetup) to build WinLook-Setup.exe from installer\winlook.iss"

@@ -13,9 +13,15 @@
 !.env.example
 config.json
 
-# IDE & OS files
+# IDE, Agent & OS files
 .vscode/
 .idea/
+.agents/
+.gemini/
+PROJECT.md
+TEST_INFRA.md
+TEST_READY.md
+tests/
 *.swp
 *.swo
 Thumbs.db

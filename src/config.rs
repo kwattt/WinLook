@@ -65,6 +65,10 @@ pub struct AppConfig {
     pub auto_copy_on_save: bool,
     /// Automatically copy recognized OCR text to clipboard immediately upon selecting a region (default: false)
     pub auto_copy_ocr: bool,
+    /// Whether to automatically check for updates on startup (default: true)
+    pub check_updates_on_startup: bool,
+    /// Optional GitHub repository override ("owner/repo" or Git URL) for update checks
+    pub github_repo: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -83,6 +87,8 @@ impl Default for AppConfig {
             screenshot_dir: default_shots,
             auto_copy_on_save: true,
             auto_copy_ocr: false,
+            check_updates_on_startup: true,
+            github_repo: None,
         }
     }
 }
@@ -455,5 +461,41 @@ mod tests {
             .expect("Windows Credential Manager get_password failed");
         assert_eq!(loaded, "sk-test-wincred-persistence");
         let _ = entry.delete_credential();
+    }
+
+    #[test]
+    fn test_app_config_updater_defaults() {
+        let cfg = AppConfig::default();
+        assert_eq!(cfg.check_updates_on_startup, true);
+        assert_eq!(cfg.github_repo, None);
+    }
+
+    #[test]
+    fn test_app_config_updater_fields_serialization_roundtrip() {
+        let mut cfg = AppConfig::default();
+        cfg.check_updates_on_startup = false;
+        cfg.github_repo = Some("kwattt/WinLook".to_string());
+
+        let json = serde_json::to_string_pretty(&cfg).expect("serialize config");
+        assert!(json.contains("\"check_updates_on_startup\": false"));
+        assert!(json.contains("\"github_repo\": \"kwattt/WinLook\""));
+
+        let deserialized: AppConfig = serde_json::from_str(&json).expect("deserialize config");
+        assert_eq!(deserialized.check_updates_on_startup, false);
+        assert_eq!(deserialized.github_repo.as_deref(), Some("kwattt/WinLook"));
+    }
+
+    #[test]
+    fn test_app_config_backward_compatibility_omitted_updater_fields() {
+        let old_json = r#"{
+            "ocr_language": "auto",
+            "target_language": "Spanish",
+            "deepseek_model": "deepseek-chat"
+        }"#;
+
+        let cfg: AppConfig = serde_json::from_str(old_json)
+            .expect("Old config must deserialize without errors");
+        assert_eq!(cfg.check_updates_on_startup, true);
+        assert_eq!(cfg.github_repo, None);
     }
 }

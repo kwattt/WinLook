@@ -142,9 +142,56 @@ impl Default for OverlaySessionState {
     }
 }
 
+/// Explicitly positions the GPUI overlay window over the full virtual desktop extent (vx, vy, vw, vh)
+/// using Win32 SetWindowPos, bypassing GPUI's single-monitor bounds clamp.
+#[cfg(target_os = "windows")]
+fn span_overlay_to_virtual_desktop(vx: i32, vy: i32, width: i32, height: i32) {
+    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId,
+        HWND_TOPMOST, IsWindowVisible, SWP_FRAMECHANGED, SWP_SHOWWINDOW, SetWindowPos,
+    };
+
+    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            if pid == std::process::id() && IsWindowVisible(hwnd).as_bool() {
+                let mut cls_buf = [0u16; 64];
+                let len = GetClassNameW(hwnd, &mut cls_buf) as usize;
+                let cls = String::from_utf16_lossy(&cls_buf[..len]);
+                if cls == "Zed::Window" {
+                    let out = &mut *(lparam.0 as *mut HWND);
+                    *out = hwnd;
+                    return BOOL(0);
+                }
+            }
+        }
+        BOOL(1)
+    }
+
+    let mut found = HWND::default();
+    unsafe {
+        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut found as *mut _ as isize));
+    }
+
+    if !found.is_invalid() && !found.0.is_null() {
+        unsafe {
+            let _ = SetWindowPos(
+                found,
+                HWND_TOPMOST,
+                vx,
+                vy,
+                width,
+                height,
+                SWP_SHOWWINDOW | SWP_FRAMECHANGED,
+            );
+        }
+    }
+}
+
 /// Opens the borderless topmost fullscreen WinLook overlay window for a captured screen frame.
-/// Uses `WindowBounds::Fullscreen` so GPUI places its own window at `(0, 0, width, height)`
-/// without any titlebar/frame offset and without ever touching external windows.
+/// Uses `WindowBounds::Fullscreen` and positions over the complete virtual desktop via `SetWindowPos`.
 pub fn open_overlay_window(
     cx: &mut App,
     frame: CapturedFrame,
@@ -179,7 +226,15 @@ pub fn open_overlay_window(
         ..Default::default()
     };
 
+    let vx = frame.vx;
+    let vy = frame.vy;
+    let vw = frame.width as i32;
+    let vh = frame.height as i32;
+
     let (handle, _) = gpui_kit::open_window(options, cx, move |window, cx| {
+        #[cfg(target_os = "windows")]
+        span_overlay_to_virtual_desktop(vx, vy, vw, vh);
+
         cx.new(|cx| OverlayView::new(frame, config, on_reload_hotkey, window, cx))
     })?;
 

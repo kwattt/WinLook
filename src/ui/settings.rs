@@ -5,8 +5,12 @@ use crate::config::{
 use crate::ocr;
 use crate::ui::overlay::tokio_runtime;
 use crate::ui::{
-    BG_ACTIVE, BG_CONTROL, BG_HOVER, BG_SURFACE, BG_WINDOW, BORDER_FOCUS, BORDER_LINE, TEXT_DIM,
-    TEXT_MAIN, TEXT_SUB, icon_btn, tool_btn,
+    BG_ACTIVE, BG_CONTROL, BG_HOVER, BG_INPUT, BG_SURFACE, BG_WINDOW, BORDER_FOCUS, BORDER_LINE,
+    TEXT_DIM, TEXT_MAIN, TEXT_SUB, icon_btn, tool_btn,
+};
+use crate::updater::{
+    DownloadProgress, GitHubRelease, GitHubUpdaterClient, ReleaseAsset, UpdateCheckResult,
+    UpdateStatus,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -14,13 +18,59 @@ use gpui::{
     IntoElement, KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement as _,
     Styled, Subscription, Window, div, px, rgb,
 };
+use gpui_component::Icon;
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::scroll::ScrollableElement as _;
 use gpui_component::select::{Select, SelectEvent, SelectState};
+use gpui_component::spinner::Spinner;
 use gpui_component::switch::Switch;
 use gpui_component::{IconName, IndexPath, Sizable as _, h_flex, v_flex};
 use std::rc::Rc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::mpsc;
+
+static PENDING_UPDATE_CHECK: AtomicBool = AtomicBool::new(false);
+static PENDING_UPDATE_RESULT: Mutex<Option<UpdateCheckResult>> = Mutex::new(None);
+
+/// Requests that the next opened Settings window immediately initiates an update check.
+pub fn request_update_check_on_next_open() {
+    PENDING_UPDATE_CHECK.store(true, Ordering::SeqCst);
+}
+
+/// Stores a pre-fetched update check result (e.g. from background startup check)
+/// to be displayed when the Settings window opens.
+pub fn set_pending_update_result(result: UpdateCheckResult) {
+    if let Ok(mut lock) = PENDING_UPDATE_RESULT.lock() {
+        *lock = Some(result);
+    }
+}
+
+/// State held by SettingsWindowView for the Application Updates section.
+#[derive(Debug, Clone)]
+pub enum UpdaterUiState {
+    /// Idle state: no check active, ready to check.
+    Idle,
+    /// Currently querying GitHub Releases API.
+    Checking,
+    /// Verified up-to-date.
+    UpToDate { version: String },
+    /// Newer GitHub release is available.
+    Available {
+        release: Box<GitHubRelease>,
+        target_asset: Option<ReleaseAsset>,
+    },
+    /// Actively downloading the installer binary.
+    Downloading {
+        downloaded_bytes: u64,
+        total_bytes: Option<u64>,
+        percent: f32,
+    },
+    /// Download complete, launching detached installer process.
+    Installing,
+    /// Error encountered during check or download.
+    Error(String),
+}
 
 const AUTO_OCR_LABEL: &str = "Auto (Multi / Japanese / CJK)";
 const ENGINE_GOOGLE_LABEL: &str = "Google Translate (Default, No AI)";
@@ -44,6 +94,8 @@ pub struct SettingsWindowView {
     on_trigger_capture: Rc<dyn Fn(&mut App)>,
     on_reload_hotkey: Rc<dyn Fn(String)>,
     _subscriptions: Vec<Subscription>,
+    updater_ui_state: UpdaterUiState,
+    notes_expanded: bool,
 }
 
 impl Focusable for SettingsWindowView {
@@ -267,7 +319,33 @@ impl SettingsWindowView {
 
         let status_text = format!("Active shortcut: {}", config.hotkey);
 
-        Self {
+        let mut auto_trigger_check = false;
+        let initial_updater_state = if let Ok(mut lock) = PENDING_UPDATE_RESULT.lock() {
+            if let Some(res) = lock.take() {
+                match res.status {
+                    UpdateStatus::Available(release) => UpdaterUiState::Available {
+                        release: Box::new(release),
+                        target_asset: res.target_asset,
+                    },
+                    UpdateStatus::UpToDate => UpdaterUiState::UpToDate {
+                        version: res.current_version,
+                    },
+                    UpdateStatus::RateLimited(reset) => {
+                        UpdaterUiState::Error(format_rate_limit_msg(reset))
+                    }
+                    UpdateStatus::Failed(err) => UpdaterUiState::Error(err),
+                }
+            } else if PENDING_UPDATE_CHECK.swap(false, Ordering::SeqCst) {
+                auto_trigger_check = true;
+                UpdaterUiState::Checking
+            } else {
+                UpdaterUiState::Idle
+            }
+        } else {
+            UpdaterUiState::Idle
+        };
+
+        let view = Self {
             config,
             autostart_enabled,
             recorder_focus,
@@ -291,7 +369,20 @@ impl SettingsWindowView {
                 sub_dir,
                 sub_key,
             ],
+            updater_ui_state: initial_updater_state,
+            notes_expanded: false,
+        };
+
+        if auto_trigger_check {
+            let entity = cx.entity().clone();
+            cx.defer(move |cx| {
+                entity.update(cx, |this, cx| {
+                    this.trigger_update_check(cx);
+                });
+            });
         }
+
+        view
     }
 
     fn handle_recorder_key_down(
@@ -416,6 +507,481 @@ impl SettingsWindowView {
             }
         }
         cx.notify();
+    }
+
+    /// Dispatches an asynchronous GitHub update check on Tokio's runtime.
+    pub fn trigger_update_check(&mut self, cx: &mut Context<Self>) {
+        if matches!(
+            self.updater_ui_state,
+            UpdaterUiState::Checking | UpdaterUiState::Downloading { .. }
+        ) {
+            return;
+        }
+
+        self.updater_ui_state = UpdaterUiState::Checking;
+        self.status_text = "Checking for updates...".to_string();
+        cx.notify();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UpdateCheckResult>();
+        let client = GitHubUpdaterClient::from_config(&self.config);
+
+        tokio_runtime().spawn(async move {
+            let res = client.check_for_updates().await;
+            let _ = tx.send(res);
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Some(check_result) = rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    match check_result.status {
+                        UpdateStatus::UpToDate => {
+                            this.updater_ui_state = UpdaterUiState::UpToDate {
+                                version: check_result.current_version.clone(),
+                            };
+                            this.status_text = format!(
+                                "WinLook v{} is up to date",
+                                check_result.current_version
+                            );
+                        }
+                        UpdateStatus::Available(release) => {
+                            this.updater_ui_state = UpdaterUiState::Available {
+                                release: Box::new(release),
+                                target_asset: check_result.target_asset,
+                            };
+                            this.status_text = "New WinLook update is available!".to_string();
+                        }
+                        UpdateStatus::RateLimited(reset_time) => {
+                            let msg = format_rate_limit_msg(reset_time);
+                            this.updater_ui_state = UpdaterUiState::Error(msg.clone());
+                            this.status_text = msg;
+                        }
+                        UpdateStatus::Failed(err) => {
+                            this.updater_ui_state = UpdaterUiState::Error(err.clone());
+                            this.status_text = format!("Update check failed: {}", err);
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Dispatches streaming download of the release asset and launches the installer.
+    pub fn trigger_download_and_install(&mut self, asset: ReleaseAsset, cx: &mut Context<Self>) {
+        self.updater_ui_state = UpdaterUiState::Downloading {
+            downloaded_bytes: 0,
+            total_bytes: Some(asset.size),
+            percent: 0.0,
+        };
+        self.status_text = format!("Downloading {}...", asset.name);
+        cx.notify();
+
+        let (progress_tx, mut progress_rx) =
+            tokio::sync::mpsc::unbounded_channel::<DownloadProgress>();
+        let (done_tx, mut done_rx) =
+            tokio::sync::mpsc::unbounded_channel::<Result<std::path::PathBuf, String>>();
+
+        tokio_runtime().spawn(async move {
+            let res = crate::updater::download_asset(&asset, Some(progress_tx))
+                .await
+                .map_err(|e| format!("{:#}", e));
+            let _ = done_tx.send(res);
+        });
+
+        // 1. Progress consumer
+        cx.spawn(async move |this, cx| {
+            while let Some(prog) = progress_rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    if let UpdaterUiState::Downloading {
+                        ref mut downloaded_bytes,
+                        ref mut total_bytes,
+                        ref mut percent,
+                    } = this.updater_ui_state
+                    {
+                        *downloaded_bytes = prog.downloaded_bytes;
+                        *total_bytes = prog.total_bytes;
+                        *percent = prog.percent.unwrap_or(0.0);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+
+        // 2. Completion consumer & process execution
+        cx.spawn(async move |this, cx| {
+            if let Some(res) = done_rx.recv().await {
+                let _ = this.update(cx, |this, cx| {
+                    match res {
+                        Ok(installer_path) => {
+                            this.updater_ui_state = UpdaterUiState::Installing;
+                            this.status_text = "Starting installer...".to_string();
+                            cx.notify();
+
+                            match crate::updater::execute_installer(&installer_path) {
+                                Ok(()) => {
+                                    // Quit cleanly so winlook.exe file locks are released
+                                    cx.quit();
+                                }
+                                Err(e) => {
+                                    this.updater_ui_state = UpdaterUiState::Error(format!(
+                                        "Failed to launch installer: {}",
+                                        e
+                                    ));
+                                    this.status_text = format!("Installer error: {}", e);
+                                    cx.notify();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            this.updater_ui_state =
+                                UpdaterUiState::Error(format!("Download failed: {}", e));
+                            this.status_text = format!("Download error: {}", e);
+                            cx.notify();
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Renders the inner card contents based on UpdaterUiState.
+    fn render_updater_card(&self, cx: &Context<Self>) -> impl IntoElement {
+        let card_body = match &self.updater_ui_state {
+            UpdaterUiState::Idle => {
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_SUB))
+                            .child("WinLook is ready to check for updates."),
+                    )
+                    .child(tool_btn(
+                        "btn-check-updates",
+                        Some(IconName::RefreshCw),
+                        "Check for Updates",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.trigger_update_check(cx);
+                        }),
+                    ))
+            }
+            UpdaterUiState::Checking => {
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(Spinner::new().small())
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MAIN))
+                                    .child("Checking GitHub for the latest release..."),
+                            ),
+                    )
+                    .child(tool_btn(
+                        "btn-check-updates-busy",
+                        Some(IconName::RefreshCw),
+                        "Checking...",
+                        true,
+                        |_, _, _| {},
+                    ))
+            }
+            UpdaterUiState::UpToDate { version } => {
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::CircleCheck)
+                                    .xsmall()
+                                    .text_color(rgb(0x4ade80)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_MAIN))
+                                    .child(format!("WinLook v{} is up to date.", version)),
+                            ),
+                    )
+                    .child(tool_btn(
+                        "btn-check-again",
+                        Some(IconName::RefreshCw),
+                        "Check Again",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.trigger_update_check(cx);
+                        }),
+                    ))
+            }
+            UpdaterUiState::Available {
+                release,
+                target_asset,
+            } => {
+                let asset_opt = target_asset.clone();
+                let is_expanded = self.notes_expanded;
+                let release_url = release.html_url.clone();
+
+                v_flex()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        Icon::new(IconName::TriangleAlert)
+                                            .xsmall()
+                                            .text_color(rgb(0xfbbf24)),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(FontWeight::BOLD)
+                                            .text_color(rgb(TEXT_MAIN))
+                                            .child(format!(
+                                                "Update Available: {}",
+                                                release.tag_name
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(format_published_date(&release.published_at)),
+                            ),
+                    )
+                    .when_some(release.name.as_ref(), |el, name| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgb(TEXT_SUB))
+                                .child(name.clone()),
+                        )
+                    })
+                    .when_some(target_asset.as_ref(), |el, asset| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(TEXT_DIM))
+                                .child(format!(
+                                    "Installer asset: {} ({:.1} MB)",
+                                    asset.name,
+                                    asset.size as f64 / 1_048_576.0
+                                )),
+                        )
+                    })
+                    // Collapsible Release Notes Header
+                    .child(
+                        h_flex()
+                            .id("btn-toggle-release-notes")
+                            .items_center()
+                            .gap_1()
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(if is_expanded {
+                                    IconName::ChevronDown
+                                } else {
+                                    IconName::ChevronRight
+                                })
+                                .xsmall()
+                                .text_color(rgb(TEXT_SUB)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT_MAIN))
+                                    .child(if is_expanded {
+                                        "Hide Release Notes"
+                                    } else {
+                                        "Show Release Notes"
+                                    }),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.notes_expanded = !this.notes_expanded;
+                                cx.notify();
+                            })),
+                    )
+                    // Expanded Bounded Scrollable Release Notes
+                    .when(is_expanded, |el| {
+                        el.child(
+                            div()
+                                .w_full()
+                                .max_h(px(130.0))
+                                .overflow_y_scrollbar()
+                                .p_2()
+                                .rounded(px(3.0))
+                                .bg(rgb(BG_INPUT))
+                                .border_1()
+                                .border_color(rgb(BORDER_LINE))
+                                .text_xs()
+                                .text_color(rgb(TEXT_SUB))
+                                .child(
+                                    release
+                                        .body
+                                        .as_deref()
+                                        .filter(|b| !b.trim().is_empty())
+                                        .unwrap_or("No release notes provided.")
+                                        .to_string(),
+                                ),
+                        )
+                    })
+                    // Actions Row
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .when_some(asset_opt, |el, asset| {
+                                el.child(tool_btn(
+                                    "btn-download-install",
+                                    Some(IconName::ArrowDown),
+                                    "Download & Install",
+                                    true,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.trigger_download_and_install(asset.clone(), cx);
+                                    }),
+                                ))
+                            })
+                            .child(tool_btn(
+                                "btn-view-github-release",
+                                Some(IconName::ExternalLink),
+                                "View on GitHub",
+                                false,
+                                move |_, _, _| {
+                                    let _ = open::that(&release_url);
+                                },
+                            ))
+                            .child(tool_btn(
+                                "btn-recheck-updates",
+                                Some(IconName::RefreshCw),
+                                "Re-check",
+                                false,
+                                cx.listener(|this, _, _, cx| {
+                                    this.trigger_update_check(cx);
+                                }),
+                            )),
+                    )
+            }
+            UpdaterUiState::Downloading {
+                downloaded_bytes,
+                total_bytes,
+                percent,
+            } => {
+                let clamped = (*percent / 100.0).clamp(0.0, 1.0);
+                v_flex()
+                    .gap_1p5()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(TEXT_MAIN))
+                                    .child(format!("Downloading update... {:.0}%", percent)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(TEXT_DIM))
+                                    .child(format_bytes_progress(*downloaded_bytes, *total_bytes)),
+                            ),
+                    )
+                    // Zero-dependency native GPUI Progress Bar
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(6.0))
+                            .bg(rgb(BG_INPUT))
+                            .rounded(px(3.0))
+                            .border_1()
+                            .border_color(rgb(BORDER_LINE))
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(clamped))
+                                    .bg(rgb(0x3b82f6))
+                                    .rounded(px(2.0)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_DIM))
+                            .child(
+                                "Downloading installer from GitHub. WinLook will restart once complete.",
+                            ),
+                    )
+            }
+            UpdaterUiState::Installing => {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Spinner::new().small())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(TEXT_MAIN))
+                            .child("Download finished. Starting installer and closing WinLook..."),
+                    )
+            }
+            UpdaterUiState::Error(err) => {
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                Icon::new(IconName::CircleAlert)
+                                    .xsmall()
+                                    .text_color(rgb(0xf87171)),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(0xf87171))
+                                    .child(err.clone()),
+                            ),
+                    )
+                    .child(tool_btn(
+                        "btn-retry-check",
+                        Some(IconName::RefreshCw),
+                        "Try Again",
+                        false,
+                        cx.listener(|this, _, _, cx| {
+                            this.trigger_update_check(cx);
+                        }),
+                    ))
+            }
+        };
+
+        div()
+            .w_full()
+            .p_3()
+            .rounded(px(3.0))
+            .bg(rgb(BG_SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER_LINE))
+            .child(card_body)
     }
 }
 
@@ -880,6 +1446,59 @@ impl Render for SettingsWindowView {
                                                 }),
                                             )),
                                     ),
+                            )
+                            // ================================================================
+                            // SECTION 6: APPLICATION UPDATES
+                            // ================================================================
+                            .child(
+                                v_flex()
+                                    .py_2p5()
+                                    .gap_2()
+                                    .child(
+                                        h_flex()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(rgb(TEXT_MAIN))
+                                                    .child("Application Updates"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_SUB))
+                                                    .child(format!("WinLook v{}", env!("CARGO_PKG_VERSION"))),
+                                            ),
+                                    )
+                                    .child(
+                                        h_flex()
+                                            .justify_between()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgb(TEXT_MAIN))
+                                                    .child("Automatically check for updates on startup"),
+                                            )
+                                            .child(
+                                                Switch::new("sw-check-updates-startup")
+                                                    .small()
+                                                    .checked(self.config.check_updates_on_startup)
+                                                    .on_click(cx.listener(|this, checked, _, cx| {
+                                                        this.config.check_updates_on_startup = *checked;
+                                                        let _ = this.config.save();
+                                                        this.status_text = if *checked {
+                                                            "Startup update checks enabled".to_string()
+                                                        } else {
+                                                            "Startup update checks disabled".to_string()
+                                                        };
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                    .child(self.render_updater_card(cx)),
                             ),
                     ),
             )
@@ -903,5 +1522,42 @@ impl Render for SettingsWindowView {
                             .child("WinLook"),
                     ),
             )
+    }
+}
+
+fn format_rate_limit_msg(reset_epoch_secs: u64) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if reset_epoch_secs > now_secs {
+        let diff_mins = (reset_epoch_secs - now_secs).div_ceil(60);
+        format!(
+            "GitHub rate limit reached. Resets in ~{} min (HTTP 403)",
+            diff_mins
+        )
+    } else {
+        "GitHub rate limit reached. Please try again shortly.".to_string()
+    }
+}
+
+fn format_bytes_progress(downloaded: u64, total: Option<u64>) -> String {
+    let dl_mb = downloaded as f64 / 1_048_576.0;
+    if let Some(tot) = total {
+        let tot_mb = tot as f64 / 1_048_576.0;
+        format!("{:.1} MB / {:.1} MB", dl_mb, tot_mb)
+    } else {
+        format!("{:.1} MB", dl_mb)
+    }
+}
+
+fn format_published_date(published_at: &Option<String>) -> String {
+    match published_at {
+        Some(iso) => {
+            let date_part = iso.split('T').next().unwrap_or(iso.as_str());
+            format!("Released: {}", date_part)
+        }
+        None => String::new(),
     }
 }

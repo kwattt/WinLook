@@ -1,6 +1,6 @@
 [package]
 name = "winlook"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Ultra-lightweight Google Lens for Windows built with Rust, GPUI, Windows.Media.Ocr, and DeepSeek Vision"
 license = "MIT"
@@ -19,6 +19,7 @@ futures-util = "0.3"
 # Serialization & Utilities
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+semver = "1.0"
 anyhow = "1.0"
 base64 = "0.22"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
