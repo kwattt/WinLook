@@ -11,14 +11,26 @@ use crate::services::deepseek::TranslatedLine;
 use anyhow::{Context as _, Result};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    AnyWindowHandle, App, AppContext as _, Bounds, ClickEvent, Div, ElementId, FontWeight,
-    InteractiveElement, ParentElement, Point, SharedString, Size, Stateful,
-    StatefulInteractiveElement as _, Styled, Window, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, div, px, rgb,
+    AnyWindowHandle, App, AppContext as _, Bounds, ClickEvent, Div, ElementId, EntityId,
+    FontWeight, InteractiveElement, ParentElement, Point, SharedString, Size, Stateful,
+    StatefulInteractiveElement as _, Styled, WeakEntity, Window, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, div, px, rgb,
 };
 use gpui_component::{Icon, IconName, Sizable as _};
 use overlay::OverlayView;
 use settings::SettingsWindowView;
+use std::cell::RefCell;
+use std::rc::Rc;
+
+struct OverlayInstance {
+    window: AnyWindowHandle,
+    entity_id: EntityId,
+    view: WeakEntity<OverlayView>,
+}
+
+thread_local! {
+    static OVERLAY_INSTANCES: RefCell<Vec<OverlayInstance>> = const { RefCell::new(Vec::new()) };
+}
 
 // ============================================================================
 // NATIVE MATTE DARK PALETTE (NEUTRAL DESKTOP UTILITY — ZERO NEON / VIBECODE)
@@ -144,12 +156,30 @@ impl Default for OverlaySessionState {
 
 /// Closes all active WinLook overlay windows across all monitors.
 pub fn close_all_overlay_windows(cx: &mut App) {
-    for window in cx.windows() {
-        if window.downcast::<OverlayView>().is_some() {
-            let _ = window.update(cx, |_, window, _| {
-                window.remove_window();
-            });
-        }
+    let handles: Vec<AnyWindowHandle> = OVERLAY_INSTANCES.with(|cell| {
+        cell.borrow_mut().drain(..).map(|entry| entry.window).collect()
+    });
+    for handle in handles {
+        let _ = handle.update(cx, |_, window, _| {
+            window.remove_window();
+        });
+    }
+}
+
+/// Clears any active selection/OCR/translation state on sibling monitor overlays
+/// when the user starts a new selection on another monitor.
+pub fn clear_other_overlay_selections(current_id: EntityId, cx: &mut App) {
+    let siblings: Vec<WeakEntity<OverlayView>> = OVERLAY_INSTANCES.with(|cell| {
+        cell.borrow()
+            .iter()
+            .filter(|entry| entry.entity_id != current_id)
+            .map(|entry| entry.view.clone())
+            .collect()
+    });
+    for weak_view in siblings {
+        let _ = weak_view.update(cx, |other, cx| {
+            other.clear_selection_state(cx);
+        });
     }
 }
 
@@ -159,6 +189,53 @@ pub fn dismiss_overlay(window: &mut Window, cx: &mut App) {
     cx.defer(|cx| {
         close_all_overlay_windows(cx);
     });
+}
+
+fn open_single_overlay_window(
+    cx: &mut App,
+    bounds: Bounds<gpui::Pixels>,
+    display_id: Option<gpui::DisplayId>,
+    focus: bool,
+    frame: CapturedFrame,
+    config: AppConfig,
+    on_reload_hotkey: impl Fn(String) + 'static,
+) -> Result<AnyWindowHandle> {
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Fullscreen(bounds)),
+        display_id,
+        titlebar: None,
+        focus,
+        show: true,
+        kind: WindowKind::PopUp,
+        is_movable: false,
+        is_resizable: false,
+        is_minimizable: false,
+        window_background: WindowBackgroundAppearance::Opaque,
+        window_decorations: None,
+        ..Default::default()
+    };
+
+    let created: Rc<RefCell<Option<(EntityId, WeakEntity<OverlayView>)>>> =
+        Rc::new(RefCell::new(None));
+    let created_clone = created.clone();
+
+    let (handle, _) = gpui_kit::open_window(options, cx, move |window, cx| {
+        let entity = cx.new(|cx| OverlayView::new(frame, config, on_reload_hotkey, window, cx));
+        *created_clone.borrow_mut() = Some((entity.entity_id(), entity.downgrade()));
+        entity
+    })?;
+
+    if let Some((entity_id, view)) = created.borrow_mut().take() {
+        OVERLAY_INSTANCES.with(|cell| {
+            cell.borrow_mut().push(OverlayInstance {
+                window: handle,
+                entity_id,
+                view,
+            });
+        });
+    }
+
+    Ok(handle)
 }
 
 /// Opens borderless topmost fullscreen WinLook overlay windows for a captured screen frame.
@@ -205,26 +282,15 @@ pub fn open_overlay_window(
                 )
             });
 
-            let options = WindowOptions {
-                window_bounds: Some(WindowBounds::Fullscreen(bounds)),
-                display_id: matched_display.map(|d| d.id()),
-                titlebar: None,
-                focus: monitor.is_primary,
-                show: true,
-                kind: WindowKind::PopUp,
-                is_movable: false,
-                is_resizable: false,
-                is_minimizable: false,
-                window_background: WindowBackgroundAppearance::Opaque,
-                window_decorations: None,
-                ..Default::default()
-            };
-
-            let cfg = config.clone();
-            let cb = on_reload_hotkey.clone();
-            let (handle, _) = gpui_kit::open_window(options, cx, move |window, cx| {
-                cx.new(|cx| OverlayView::new(mon_frame, cfg, cb, window, cx))
-            })?;
+            let handle = open_single_overlay_window(
+                cx,
+                bounds,
+                matched_display.map(|d| d.id()),
+                monitor.is_primary,
+                mon_frame,
+                config.clone(),
+                on_reload_hotkey.clone(),
+            )?;
 
             if monitor.is_primary || primary_handle.is_none() {
                 primary_handle = Some(handle);
@@ -253,26 +319,15 @@ pub fn open_overlay_window(
         )
     });
 
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Fullscreen(bounds)),
-        display_id: matched_display.map(|d| d.id()),
-        titlebar: None,
-        focus: true,
-        show: true,
-        kind: WindowKind::PopUp,
-        is_movable: false,
-        is_resizable: false,
-        is_minimizable: false,
-        window_background: WindowBackgroundAppearance::Opaque,
-        window_decorations: None,
-        ..Default::default()
-    };
-
-    let (handle, _) = gpui_kit::open_window(options, cx, move |window, cx| {
-        cx.new(|cx| OverlayView::new(frame, config, on_reload_hotkey, window, cx))
-    })?;
-
-    Ok(handle)
+    open_single_overlay_window(
+        cx,
+        bounds,
+        matched_display.map(|d| d.id()),
+        true,
+        frame,
+        config,
+        on_reload_hotkey,
+    )
 }
 
 /// Restores normal window styles (`WS_OVERLAPPEDWINDOW` and `HWND_NOTOPMOST`) on any visible
