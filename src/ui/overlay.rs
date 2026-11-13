@@ -196,6 +196,24 @@ impl OverlayView {
         .detach();
     }
 
+    pub fn clear_selection_state(&mut self, cx: &mut Context<Self>) {
+        if self.state.selection.is_some()
+            || self.is_dragging
+            || !self.state.ocr_lines.is_empty()
+            || !self.state.translations.is_empty()
+        {
+            self.drag_start = None;
+            self.is_dragging = false;
+            self.state.selection = None;
+            self.state.ocr_lines.clear();
+            self.state.auto_ocr_text.clear();
+            self.state.translations.clear();
+            self.state.status_message = None;
+            self.state.mode = OverlayMode::RegionSelect;
+            cx.notify();
+        }
+    }
+
     pub fn effective_selection(&self) -> ScreenRect {
         self.state
             .selection
@@ -739,25 +757,7 @@ impl Render for OverlayView {
 
                             let current_id = cx.entity_id();
                             cx.defer(move |cx| {
-                                for win in cx.windows() {
-                                    if let Some(view) = win.downcast::<OverlayView>() {
-                                        if view.entity(cx).ok().map(|e| e.entity_id())
-                                            != Some(current_id)
-                                        {
-                                            let _ = view.update(cx, |other, _window, cx| {
-                                                if other.state.selection.is_some() {
-                                                    other.state.selection = None;
-                                                    other.state.ocr_lines.clear();
-                                                    other.state.auto_ocr_text.clear();
-                                                    other.state.translations.clear();
-                                                    other.state.status_message = None;
-                                                    other.state.mode = OverlayMode::RegionSelect;
-                                                    cx.notify();
-                                                }
-                                            });
-                                        }
-                                    }
-                                }
+                                crate::ui::clear_other_overlay_selections(current_id, cx);
                             });
                         }),
                     )
