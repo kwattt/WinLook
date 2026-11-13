@@ -164,6 +164,7 @@ impl ScreenRect {
 /// Metadata describing an attached physical monitor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MonitorInfo {
+    pub display_id: u64,        // Platform HMONITOR / GPUI DisplayId
     pub rect: ScreenRect,       // In virtual desktop coordinates
     pub work_rect: ScreenRect,  // In virtual desktop coordinates
     pub is_primary: bool,
@@ -244,6 +245,44 @@ impl CapturedFrame {
     /// Returns the primary monitor metadata, if enumerated.
     pub fn primary_monitor(&self) -> Option<&MonitorInfo> {
         self.monitors.iter().find(|m| m.is_primary)
+    }
+
+    /// Slices a single monitor's exact pixel region out of this virtual-desktop capture,
+    /// producing a 1:1 `CapturedFrame` with that monitor's own dimensions, origin, and DPI scale.
+    pub fn frame_for_monitor(&self, monitor: &MonitorInfo) -> Result<Self> {
+        let buf_rect = monitor.buffer_rect(self.vx, self.vy);
+        let x0 = (buf_rect.x.max(0) as u32).min(self.width.saturating_sub(1));
+        let y0 = (buf_rect.y.max(0) as u32).min(self.height.saturating_sub(1));
+        let w = buf_rect.width.min(self.width.saturating_sub(x0)).max(1);
+        let h = buf_rect.height.min(self.height.saturating_sub(y0)).max(1);
+
+        let src_stride = (self.width as usize) * 4;
+        let row_bytes = (w as usize) * 4;
+        let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
+
+        for row in 0..(h as usize) {
+            let src_start = ((y0 as usize) + row) * src_stride + (x0 as usize) * 4;
+            let dst_start = row * row_bytes;
+            bgra[dst_start..dst_start + row_bytes]
+                .copy_from_slice(&self.bgra_raw[src_start..src_start + row_bytes]);
+        }
+
+        let bgra_arc = Arc::new(bgra.clone());
+        let bgra_img = RgbaImage::from_raw(w, h, bgra)
+            .context("Failed to construct per-monitor GPUI BGRA frame")?;
+        let render_image = Arc::new(gpui::RenderImage::new(vec![Frame::new(bgra_img)]));
+
+        Ok(Self {
+            bgra_raw: bgra_arc,
+            render_image: render_image.clone(),
+            image: render_image,
+            width: w,
+            height: h,
+            vx: monitor.rect.x,
+            vy: monitor.rect.y,
+            scale_factor: monitor.scale_factor.max(1.0),
+            monitors: vec![*monitor],
+        })
     }
 
     /// Crops a sub-region of the captured screen and converts only the cropped pixels from BGRA to RGBA.
@@ -453,6 +492,7 @@ pub fn enumerate_monitors() -> Vec<MonitorInfo> {
             };
 
             list.push(MonitorInfo {
+                display_id: hmonitor.0 as u64,
                 rect,
                 work_rect,
                 is_primary,
@@ -513,6 +553,7 @@ pub fn capture_virtual_screen() -> Result<CapturedFrame> {
             let sys_dpi = GetDpiForSystem();
             let scale = if sys_dpi > 0 { (sys_dpi as f32 / 96.0).max(1.0) } else { 1.0 };
             monitors.push(MonitorInfo {
+                display_id: 0,
                 rect: ScreenRect { x: vx, y: vy, width: vw as u32, height: vh as u32 },
                 work_rect: ScreenRect { x: vx, y: vy, width: vw as u32, height: vh as u32 },
                 is_primary: true,
@@ -760,5 +801,94 @@ mod tests {
         assert_eq!(clamped.y, 400);
         assert_eq!(clamped.width, 100);
         assert_eq!(clamped.height, 100);
+    }
+
+    #[test]
+    fn test_frame_for_monitor_ultrawide_mixed_dpi_and_negative_coords() {
+        // Topology:
+        // - Primary ultrawide monitor: 344x144 at (0, 0), scale 1.0 (scaled down 10x for fast test)
+        // - Secondary monitor above & left: 192x108 at (-100, -108), scale 1.5
+        // Virtual desktop: vx = -100, vy = -108, vw = 444, vh = 252
+        let vx = -100;
+        let vy = -108;
+        let vw = 444u32;
+        let vh = 252u32;
+
+        let prim = MonitorInfo {
+            display_id: 1,
+            rect: ScreenRect { x: 0, y: 0, width: 344, height: 144 },
+            work_rect: ScreenRect { x: 0, y: 0, width: 344, height: 140 },
+            is_primary: true,
+            scale_factor: 1.0,
+        };
+        let sec = MonitorInfo {
+            display_id: 2,
+            rect: ScreenRect { x: -100, y: -108, width: 192, height: 108 },
+            work_rect: ScreenRect { x: -100, y: -108, width: 192, height: 104 },
+            is_primary: false,
+            scale_factor: 1.5,
+        };
+
+        // Fill buffer with 0 (black dead zones), then paint distinct BGRA values for each monitor
+        let mut bgra = vec![0u8; (vw * vh * 4) as usize];
+        let stride = (vw as usize) * 4;
+
+        // Paint primary monitor [x_buf = 100..444, y_buf = 108..252] with B=10, G=20, R=30, A=255
+        for y in 108..252 {
+            for x in 100..444 {
+                let idx = y * stride + x * 4;
+                bgra[idx] = 10;
+                bgra[idx + 1] = 20;
+                bgra[idx + 2] = 30;
+                bgra[idx + 3] = 255;
+            }
+        }
+
+        // Paint secondary monitor [x_buf = 0..192, y_buf = 0..108] with B=40, G=50, R=60, A=255
+        for y in 0..108 {
+            for x in 0..192 {
+                let idx = y * stride + x * 4;
+                bgra[idx] = 40;
+                bgra[idx + 1] = 50;
+                bgra[idx + 2] = 60;
+                bgra[idx + 3] = 255;
+            }
+        }
+
+        let bgra_arc = Arc::new(bgra.clone());
+        let bgra_img = RgbaImage::from_raw(vw, vh, bgra).unwrap();
+        let render_image = Arc::new(gpui::RenderImage::new(vec![Frame::new(bgra_img)]));
+
+        let full = CapturedFrame {
+            bgra_raw: bgra_arc,
+            render_image: render_image.clone(),
+            image: render_image,
+            width: vw,
+            height: vh,
+            vx,
+            vy,
+            scale_factor: 1.0,
+            monitors: vec![prim, sec],
+        };
+
+        let prim_frame = full.frame_for_monitor(&prim).unwrap();
+        assert_eq!(prim_frame.width, 344);
+        assert_eq!(prim_frame.height, 144);
+        assert_eq!(prim_frame.vx, 0);
+        assert_eq!(prim_frame.vy, 0);
+        assert_eq!(prim_frame.scale_factor, 1.0);
+        assert_eq!(prim_frame.logical_width(), 344.0);
+        assert_eq!(prim_frame.logical_height(), 144.0);
+        assert_eq!(&prim_frame.bgra_raw[0..4], &[10, 20, 30, 255]);
+
+        let sec_frame = full.frame_for_monitor(&sec).unwrap();
+        assert_eq!(sec_frame.width, 192);
+        assert_eq!(sec_frame.height, 108);
+        assert_eq!(sec_frame.vx, -100);
+        assert_eq!(sec_frame.vy, -108);
+        assert_eq!(sec_frame.scale_factor, 1.5);
+        assert_eq!(sec_frame.logical_width(), 128.0);
+        assert_eq!(sec_frame.logical_height(), 72.0);
+        assert_eq!(&sec_frame.bgra_raw[0..4], &[40, 50, 60, 255]);
     }
 }

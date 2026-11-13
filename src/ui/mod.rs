@@ -8,7 +8,7 @@ use crate::capture::{CapturedFrame, ScreenRect};
 use crate::config::AppConfig;
 use crate::ocr::OcrLineBox;
 use crate::services::deepseek::TranslatedLine;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AnyWindowHandle, App, AppContext as _, Bounds, ClickEvent, Div, ElementId, FontWeight,
@@ -142,78 +142,120 @@ impl Default for OverlaySessionState {
     }
 }
 
-/// Explicitly positions the GPUI overlay window over the full virtual desktop extent (vx, vy, vw, vh)
-/// using Win32 SetWindowPos, bypassing GPUI's single-monitor bounds clamp.
-#[cfg(target_os = "windows")]
-fn span_overlay_to_virtual_desktop(vx: i32, vy: i32, width: i32, height: i32) {
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetWindowThreadProcessId,
-        HWND_TOPMOST, IsWindowVisible, SWP_FRAMECHANGED, SWP_SHOWWINDOW, SetWindowPos,
-    };
-
-    unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-        let mut pid = 0u32;
-        unsafe {
-            GetWindowThreadProcessId(hwnd, Some(&mut pid));
-            if pid == std::process::id() && IsWindowVisible(hwnd).as_bool() {
-                let mut cls_buf = [0u16; 64];
-                let len = GetClassNameW(hwnd, &mut cls_buf) as usize;
-                let cls = String::from_utf16_lossy(&cls_buf[..len]);
-                if cls == "Zed::Window" {
-                    let out = &mut *(lparam.0 as *mut HWND);
-                    *out = hwnd;
-                    return BOOL(0);
-                }
-            }
-        }
-        BOOL(1)
-    }
-
-    let mut found = HWND::default();
-    unsafe {
-        let _ = EnumWindows(Some(enum_proc), LPARAM(&mut found as *mut _ as isize));
-    }
-
-    if !found.is_invalid() && !found.0.is_null() {
-        unsafe {
-            let _ = SetWindowPos(
-                found,
-                HWND_TOPMOST,
-                vx,
-                vy,
-                width,
-                height,
-                SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-            );
+/// Closes all active WinLook overlay windows across all monitors.
+pub fn close_all_overlay_windows(cx: &mut App) {
+    for window in cx.windows() {
+        if window.downcast::<OverlayView>().is_some() {
+            let _ = window.update(cx, |_, window, _| {
+                window.remove_window();
+            });
         }
     }
 }
 
-/// Opens the borderless topmost fullscreen WinLook overlay window for a captured screen frame.
-/// Uses `WindowBounds::Fullscreen` and positions over the complete virtual desktop via `SetWindowPos`.
+/// Immediately closes the current overlay window and defers closing any sibling monitor overlays.
+pub fn dismiss_overlay(window: &mut Window, cx: &mut App) {
+    window.remove_window();
+    cx.defer(|cx| {
+        close_all_overlay_windows(cx);
+    });
+}
+
+/// Opens borderless topmost fullscreen WinLook overlay windows for a captured screen frame.
+/// Spawns one native GPUI window per physical monitor so mixed DPI scales, mixed aspect ratios
+/// (e.g. ultrawide + 16:9), and negative virtual desktop origins render 1:1 with zero dead zones.
 pub fn open_overlay_window(
     cx: &mut App,
     frame: CapturedFrame,
     config: AppConfig,
     on_reload_hotkey: impl Fn(String) + 'static + Clone,
 ) -> Result<AnyWindowHandle> {
-    let logical_w = frame.logical_width();
-    let logical_h = frame.logical_height();
+    let displays = cx.displays();
 
-    let bounds: Bounds<gpui::Pixels> = Bounds::new(
-        Point {
-            x: px(0.0),
-            y: px(0.0),
-        },
-        Size {
-            width: px(logical_w),
-            height: px(logical_h),
-        },
-    );
+    if frame.monitors.len() > 1 {
+        let mut primary_handle: Option<AnyWindowHandle> = None;
+
+        for monitor in &frame.monitors {
+            let mon_frame = frame.frame_for_monitor(monitor)?;
+            let matched_display = displays
+                .iter()
+                .find(|d| monitor.display_id != 0 && u64::from(d.id()) == monitor.display_id)
+                .or_else(|| {
+                    let (lx, ly, lw, lh) = monitor.rect.to_logical(monitor.scale_factor);
+                    displays.iter().find(|d| {
+                        let b = d.bounds();
+                        (f32::from(b.origin.x) - lx).abs() < 4.0
+                            && (f32::from(b.origin.y) - ly).abs() < 4.0
+                            && (f32::from(b.size.width) - lw).abs() < 4.0
+                            && (f32::from(b.size.height) - lh).abs() < 4.0
+                    })
+                });
+
+            let bounds = matched_display.map(|d| d.bounds()).unwrap_or_else(|| {
+                let (lx, ly, lw, lh) = monitor.rect.to_logical(monitor.scale_factor);
+                Bounds::new(
+                    Point {
+                        x: px(lx),
+                        y: px(ly),
+                    },
+                    Size {
+                        width: px(lw),
+                        height: px(lh),
+                    },
+                )
+            });
+
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Fullscreen(bounds)),
+                display_id: matched_display.map(|d| d.id()),
+                titlebar: None,
+                focus: monitor.is_primary,
+                show: true,
+                kind: WindowKind::PopUp,
+                is_movable: false,
+                is_resizable: false,
+                is_minimizable: false,
+                window_background: WindowBackgroundAppearance::Opaque,
+                window_decorations: None,
+                ..Default::default()
+            };
+
+            let cfg = config.clone();
+            let cb = on_reload_hotkey.clone();
+            let (handle, _) = gpui_kit::open_window(options, cx, move |window, cx| {
+                cx.new(|cx| OverlayView::new(mon_frame, cfg, cb, window, cx))
+            })?;
+
+            if monitor.is_primary || primary_handle.is_none() {
+                primary_handle = Some(handle);
+            }
+        }
+
+        return primary_handle.context("No monitors available to open overlay window");
+    }
+
+    let matched_display = frame.monitors.first().and_then(|m| {
+        displays
+            .iter()
+            .find(|d| m.display_id != 0 && u64::from(d.id()) == m.display_id)
+    });
+
+    let bounds = matched_display.map(|d| d.bounds()).unwrap_or_else(|| {
+        Bounds::new(
+            Point {
+                x: px(0.0),
+                y: px(0.0),
+            },
+            Size {
+                width: px(frame.logical_width()),
+                height: px(frame.logical_height()),
+            },
+        )
+    });
 
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Fullscreen(bounds)),
+        display_id: matched_display.map(|d| d.id()),
         titlebar: None,
         focus: true,
         show: true,
@@ -226,15 +268,7 @@ pub fn open_overlay_window(
         ..Default::default()
     };
 
-    let vx = frame.vx;
-    let vy = frame.vy;
-    let vw = frame.width as i32;
-    let vh = frame.height as i32;
-
     let (handle, _) = gpui_kit::open_window(options, cx, move |window, cx| {
-        #[cfg(target_os = "windows")]
-        span_overlay_to_virtual_desktop(vx, vy, vw, vh);
-
         cx.new(|cx| OverlayView::new(frame, config, on_reload_hotkey, window, cx))
     })?;
 

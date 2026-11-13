@@ -147,7 +147,7 @@ pub fn render_floating_inspector(
                             false,
                             cx.listener(|this, _, window, cx| {
                                 this.copy_selected_image(cx);
-                                window.remove_window();
+                                crate::ui::dismiss_overlay(window, cx);
                             }),
                         ))
                         .child(tool_btn(
@@ -413,12 +413,14 @@ mod tests {
 
         let monitors = vec![
             MonitorInfo {
+                display_id: 0,
                 rect: ScreenRect { x: -1920, y: 0, width: 1920, height: 1080 },
                 work_rect: ScreenRect { x: -1920, y: 0, width: 1920, height: 1040 }, // 40px taskbar at bottom
                 is_primary: false,
                 scale_factor: 1.0,
             },
             MonitorInfo {
+                display_id: 0,
                 rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1080 },
                 work_rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1040 },
                 is_primary: true,
@@ -495,12 +497,14 @@ mod tests {
 
         let monitors = vec![
             MonitorInfo {
+                display_id: 0,
                 rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1080 },
                 work_rect: ScreenRect { x: 0, y: 0, width: 1920, height: 1040 },
                 is_primary: true,
                 scale_factor: 1.0,
             },
             MonitorInfo {
+                display_id: 0,
                 rect: ScreenRect { x: 1920, y: 0, width: 1080, height: 1920 },
                 work_rect: ScreenRect { x: 1920, y: 0, width: 1080, height: 1880 },
                 is_primary: false,

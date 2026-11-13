@@ -1,6 +1,6 @@
 [package]
 name = "winlook"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Ultra-lightweight Google Lens for Windows built with Rust, GPUI, Windows.Media.Ocr, and DeepSeek Vision"
 license = "MIT"

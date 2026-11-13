@@ -3,7 +3,7 @@
 
 #define MyAppName "WinLook"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.0"
+  #define MyAppVersion "0.2.1"
 #endif
 #define MyAppPublisher "WinLook"
 #define MyAppExeName "winlook.exe"

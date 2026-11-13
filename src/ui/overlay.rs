@@ -369,8 +369,8 @@ impl OverlayView {
             }
         });
 
-        // Immediately close the region select overlay on the same click
-        window.remove_window();
+        // Immediately close all overlay windows on the same click
+        crate::ui::dismiss_overlay(window, cx);
     }
 
     pub fn trigger_ask_deepseek(
@@ -479,13 +479,13 @@ impl OverlayView {
         cx.notify();
     }
 
-    fn on_dismiss(&mut self, _: &DismissOverlay, window: &mut Window, _cx: &mut Context<Self>) {
-        window.remove_window();
+    fn on_dismiss(&mut self, _: &DismissOverlay, window: &mut Window, cx: &mut Context<Self>) {
+        crate::ui::dismiss_overlay(window, cx);
     }
 
     fn on_copy_action(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
         self.copy_selected_image(cx);
-        window.remove_window();
+        crate::ui::dismiss_overlay(window, cx);
     }
 
     fn on_save_png_action(
@@ -533,6 +533,7 @@ impl OverlayView {
                             let reload_cb = reload_cb.clone();
                             window.remove_window();
                             cx.defer(move |cx| {
+                                crate::ui::close_all_overlay_windows(cx);
                                 let reload_for_capture = reload_cb.clone();
                                 let reload_for_settings = reload_cb.clone();
                                 let _ = open_settings_window(
@@ -735,6 +736,29 @@ impl Render for OverlayView {
                             this.state.status_message = None;
                             this.state.mode = OverlayMode::RegionSelect;
                             cx.notify();
+
+                            let current_id = cx.entity_id();
+                            cx.defer(move |cx| {
+                                for win in cx.windows() {
+                                    if let Some(view) = win.downcast::<OverlayView>() {
+                                        if view.entity(cx).ok().map(|e| e.entity_id())
+                                            != Some(current_id)
+                                        {
+                                            let _ = view.update(cx, |other, _window, cx| {
+                                                if other.state.selection.is_some() {
+                                                    other.state.selection = None;
+                                                    other.state.ocr_lines.clear();
+                                                    other.state.auto_ocr_text.clear();
+                                                    other.state.translations.clear();
+                                                    other.state.status_message = None;
+                                                    other.state.mode = OverlayMode::RegionSelect;
+                                                    cx.notify();
+                                                }
+                                            });
+                                        }
+                                    }
+                                }
+                            });
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
@@ -789,8 +813,8 @@ impl Render for OverlayView {
                     )
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(|_, _, window, _| {
-                            window.remove_window();
+                        cx.listener(|_, _, window, cx| {
+                            crate::ui::dismiss_overlay(window, cx);
                         }),
                     )
                     .when(selection.is_none(), |canvas| {
