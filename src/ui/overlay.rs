@@ -1,3 +1,6 @@
+use crate::annotations::{
+    Annotation, AnnotationShape, arrow_head_points, clamp_to_rect, ellipse_points,
+};
 use crate::capture::{CapturedFrame, ScreenRect, copy_text_to_clipboard};
 use crate::config::AppConfig;
 use crate::ocr::{self, OcrLineBox};
@@ -13,8 +16,8 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::{
     App, AppContext as _, Context, CursorStyle, Entity, FocusHandle, Focusable, FontWeight,
     InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement, Render, SharedString, Styled, StyledImage as _,
-    Subscription, Window, div, img, px, rgb, rgba,
+    MouseUpEvent, ObjectFit, ParentElement, PathBuilder, Pixels, Point, Render, SharedString,
+    Styled, StyledImage as _, Subscription, Window, canvas, div, img, point, px, rgb, rgba,
 };
 use gpui_component::IconName;
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -26,7 +29,7 @@ use tokio::sync::mpsc;
 
 gpui_kit::actions!(
     winlook_overlay,
-    [DismissOverlay, CopySelection, SaveSelectionPng]
+    [DismissOverlay, CopySelection, SaveSelectionPng, UndoAnnotation]
 );
 
 /// Shared background Tokio runtime for `reqwest` (DeepSeek SSE + Google Lens) and `Windows.Media.Ocr`.
@@ -58,6 +61,7 @@ pub struct OverlayView {
     pub on_reload_hotkey: Rc<dyn Fn(String)>,
     drag_start: Option<(f32, f32)>,
     is_dragging: bool,
+    is_drawing: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -79,6 +83,7 @@ impl OverlayView {
             KeyBinding::new("escape", DismissOverlay, Some("WinLookOverlay")),
             KeyBinding::new("ctrl-c", CopySelection, Some("WinLookOverlay")),
             KeyBinding::new("ctrl-s", SaveSelectionPng, Some("WinLookOverlay")),
+            KeyBinding::new("ctrl-z", UndoAnnotation, Some("WinLookOverlay")),
         ]);
 
         let focus_handle = cx.focus_handle();
@@ -126,6 +131,7 @@ impl OverlayView {
             on_reload_hotkey: Rc::new(on_reload_hotkey),
             drag_start: None,
             is_dragging: false,
+            is_drawing: false,
             _subscriptions: vec![sub_prompt, sub_api_key],
         }
     }
@@ -224,7 +230,10 @@ impl OverlayView {
 
     pub fn copy_selected_image(&mut self, cx: &mut Context<Self>) {
         let rect = self.effective_selection();
-        match self.frame.copy_crop_to_clipboard(rect) {
+        match self
+            .frame
+            .copy_crop_to_clipboard_with_annotations(rect, &self.state.annotations)
+        {
             Ok(_) => {
                 self.state.status_message = Some("Copied image to clipboard".to_string());
             }
@@ -237,7 +246,11 @@ impl OverlayView {
 
     pub fn save_selected_screenshot(&mut self, cx: &mut Context<Self>) {
         let rect = self.effective_selection();
-        match self.frame.save_crop_to_disk(rect, &self.config) {
+        match self.frame.save_crop_to_disk_with_annotations(
+            rect,
+            &self.config,
+            &self.state.annotations,
+        ) {
             Ok(path) => {
                 let filename = path
                     .file_name()
@@ -349,7 +362,10 @@ impl OverlayView {
         cx: &mut Context<Self>,
     ) {
         let rect = self.effective_selection();
-        let jpeg_bytes = match self.frame.crop_to_jpeg_bytes(rect) {
+        let jpeg_bytes = match self
+            .frame
+            .crop_to_jpeg_bytes_with_annotations(rect, &self.state.annotations)
+        {
             Ok(b) => b,
             Err(e) => {
                 self.state.status_message = Some(format!("Encode error: {}", e));
@@ -386,7 +402,11 @@ impl OverlayView {
         }
 
         let rect = self.effective_selection();
-        let webp_data_url = match self.frame.crop_to_vision_data_url(rect, 1280) {
+        let webp_data_url = match self.frame.crop_to_vision_data_url_with_annotations(
+            rect,
+            1280,
+            &self.state.annotations,
+        ) {
             Ok(url) => url,
             Err(e) => {
                 self.state.status_message = Some(format!("Encode error: {}", e));
@@ -480,7 +500,25 @@ impl OverlayView {
     }
 
     fn on_dismiss(&mut self, _: &DismissOverlay, window: &mut Window, cx: &mut Context<Self>) {
-        crate::ui::dismiss_overlay(window, cx);
+        if self.state.mode == OverlayMode::Draw {
+            self.state.mode = OverlayMode::RegionSelect;
+            self.is_drawing = false;
+            self.state.active_annotation = None;
+            cx.notify();
+        } else {
+            crate::ui::dismiss_overlay(window, cx);
+        }
+    }
+
+    fn on_undo_action(
+        &mut self,
+        _: &UndoAnnotation,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.annotations.pop().is_some() {
+            cx.notify();
+        }
     }
 
     fn on_copy_action(&mut self, _: &CopySelection, window: &mut Window, cx: &mut Context<Self>) {
@@ -624,10 +662,11 @@ impl Render for OverlayView {
         let scale = self.frame.scale_factor;
         let selection = self.state.selection;
         let is_translate_mode = self.state.mode == OverlayMode::InPlaceTranslate;
+        let is_draw_mode = self.state.mode == OverlayMode::Draw;
 
         // Render subtle clickable OCR boxes or in-place translations strictly inside the selected region
-        let region_ocr_elements: Vec<_> = if let Some(sel) = selection.filter(|_| !self.is_dragging)
-        {
+        let region_ocr_elements: Vec<_> =
+            if let Some(sel) = selection.filter(|_| !self.is_dragging && !is_draw_mode) {
             self.state
                 .ocr_lines
                 .iter()
@@ -705,6 +744,7 @@ impl Render for OverlayView {
             .on_action(cx.listener(Self::on_dismiss))
             .on_action(cx.listener(Self::on_copy_action))
             .on_action(cx.listener(Self::on_save_png_action))
+            .on_action(cx.listener(Self::on_undo_action))
             .relative()
             .w(px(lw))
             .h(px(lh))
@@ -728,9 +768,33 @@ impl Render for OverlayView {
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
                             let x = f32::from(event.position.x);
                             let y = f32::from(event.position.y);
+                            let s = if this.frame.scale_factor <= 0.0 {
+                                1.0
+                            } else {
+                                this.frame.scale_factor
+                            };
+
+                            if this.state.mode == OverlayMode::Draw {
+                                if let Some(sel) = this.state.selection {
+                                    let pt = clamp_to_rect((x * s, y * s), sel);
+                                    this.is_drawing = true;
+                                    this.state.active_annotation = Some(Annotation::start(
+                                        this.state.draw_tool,
+                                        pt,
+                                        this.state.draw_color,
+                                        this.state.draw_stroke_width,
+                                    ));
+                                    cx.notify();
+                                    return;
+                                }
+                            }
+
                             this.drag_start = Some((x, y));
                             this.is_dragging = true;
+                            this.is_drawing = false;
                             this.state.selection = None;
+                            this.state.annotations.clear();
+                            this.state.active_annotation = None;
                             this.state.ocr_lines.clear();
                             this.state.auto_ocr_text.clear();
                             this.state.status_message = None;
@@ -747,6 +811,9 @@ impl Render for OverlayView {
                                             let _ = view.update(cx, |other, _window, cx| {
                                                 if other.state.selection.is_some() {
                                                     other.state.selection = None;
+                                                    other.state.annotations.clear();
+                                                    other.state.active_annotation = None;
+                                                    other.is_drawing = false;
                                                     other.state.ocr_lines.clear();
                                                     other.state.auto_ocr_text.clear();
                                                     other.state.translations.clear();
@@ -762,6 +829,27 @@ impl Render for OverlayView {
                         }),
                     )
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                        if this.is_drawing {
+                            if let (Some(sel), Some(active)) =
+                                (this.state.selection, this.state.active_annotation.as_mut())
+                            {
+                                let s = if this.frame.scale_factor <= 0.0 {
+                                    1.0
+                                } else {
+                                    this.frame.scale_factor
+                                };
+                                let pt = clamp_to_rect(
+                                    (
+                                        f32::from(event.position.x) * s,
+                                        f32::from(event.position.y) * s,
+                                    ),
+                                    sel,
+                                );
+                                active.update(pt);
+                                cx.notify();
+                            }
+                            return;
+                        }
                         if !this.is_dragging {
                             return;
                         }
@@ -784,6 +872,31 @@ impl Render for OverlayView {
                     .on_mouse_up(
                         MouseButton::Left,
                         cx.listener(|this, event: &MouseUpEvent, _, cx| {
+                            if this.is_drawing {
+                                this.is_drawing = false;
+                                if let Some(mut ann) = this.state.active_annotation.take() {
+                                    if let Some(sel) = this.state.selection {
+                                        let s = if this.frame.scale_factor <= 0.0 {
+                                            1.0
+                                        } else {
+                                            this.frame.scale_factor
+                                        };
+                                        let pt = clamp_to_rect(
+                                            (
+                                                f32::from(event.position.x) * s,
+                                                f32::from(event.position.y) * s,
+                                            ),
+                                            sel,
+                                        );
+                                        ann.update(pt);
+                                    }
+                                    if ann.is_meaningful() {
+                                        this.state.annotations.push(ann);
+                                    }
+                                }
+                                cx.notify();
+                                return;
+                            }
                             if !this.is_dragging {
                                 return;
                             }
@@ -907,6 +1020,94 @@ impl Render for OverlayView {
                                     .child(format!("{} × {}", sel.width, sel.height)),
                             )
                     }),
+            )
+            // 2b. Vector annotation layer inside the selection
+            .when(
+                selection.is_some()
+                    && (!self.state.annotations.is_empty() || self.state.active_annotation.is_some()),
+                |root| {
+                    let mut all_anns = self.state.annotations.clone();
+                    if let Some(active) = &self.state.active_annotation {
+                        all_anns.push(active.clone());
+                    }
+                    let s = if scale <= 0.0 { 1.0 } else { scale };
+                    root.child(
+                        canvas(
+                            |_, _, _| (),
+                            move |bounds, _, window, _| {
+                                let ox = bounds.origin.x;
+                                let oy = bounds.origin.y;
+                                let to_pt = |p: (f32, f32)| -> Point<Pixels> {
+                                    point(ox + px(p.0 / s), oy + px(p.1 / s))
+                                };
+
+                                for ann in &all_anns {
+                                    let mut builder = PathBuilder::stroke(px(ann.stroke_width));
+                                    match &ann.shape {
+                                        AnnotationShape::Freehand(pts) => {
+                                            if pts.len() == 1 {
+                                                let p = to_pt(pts[0]);
+                                                builder.move_to(p);
+                                                builder.line_to(point(p.x + px(0.5), p.y + px(0.5)));
+                                            } else if let Some((first, rest)) = pts.split_first() {
+                                                builder.move_to(to_pt(*first));
+                                                for p in rest {
+                                                    builder.line_to(to_pt(*p));
+                                                }
+                                            }
+                                        }
+                                        AnnotationShape::Line { start, end } => {
+                                            builder.move_to(to_pt(*start));
+                                            builder.line_to(to_pt(*end));
+                                        }
+                                        AnnotationShape::Arrow { start, end } => {
+                                            let p0 = to_pt(*start);
+                                            let p1 = to_pt(*end);
+                                            builder.move_to(p0);
+                                            builder.line_to(p1);
+                                            if let Some((w1, w2)) = arrow_head_points(
+                                                *start,
+                                                *end,
+                                                (ann.stroke_width * s).max(1.0),
+                                            ) {
+                                                builder.move_to(p1);
+                                                builder.line_to(to_pt(w1));
+                                                builder.move_to(p1);
+                                                builder.line_to(to_pt(w2));
+                                            }
+                                        }
+                                        AnnotationShape::Rect { start, end } => {
+                                            let min_x = start.0.min(end.0);
+                                            let max_x = start.0.max(end.0);
+                                            let min_y = start.1.min(end.1);
+                                            let max_y = start.1.max(end.1);
+                                            let poly = [
+                                                to_pt((min_x, min_y)),
+                                                to_pt((max_x, min_y)),
+                                                to_pt((max_x, max_y)),
+                                                to_pt((min_x, max_y)),
+                                            ];
+                                            builder.add_polygon(&poly, true);
+                                        }
+                                        AnnotationShape::Ellipse { start, end } => {
+                                            let poly: Vec<Point<Pixels>> =
+                                                ellipse_points(*start, *end, 64)
+                                                    .into_iter()
+                                                    .map(to_pt)
+                                                    .collect();
+                                            builder.add_polygon(&poly, true);
+                                        }
+                                    }
+                                    if let Ok(path) = builder.build() {
+                                        window.paint_path(path, rgb(ann.color));
+                                    }
+                                }
+                            },
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                },
             )
             // 3. Auto-OCR lines & In-Place Translations inside selection
             .children(region_ocr_elements)

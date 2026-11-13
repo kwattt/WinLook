@@ -4,6 +4,7 @@ pub mod inspector;
 pub mod overlay;
 pub mod settings;
 
+use crate::annotations::{Annotation, DRAW_COLOR_PRESETS, DrawTool};
 use crate::capture::{CapturedFrame, ScreenRect};
 use crate::config::AppConfig;
 use crate::ocr::OcrLineBox;
@@ -102,6 +103,8 @@ pub fn icon_btn(
 pub enum OverlayMode {
     /// Default mode: auto-extracts OCR inside the selected region.
     RegionSelect,
+    /// Drawing/annotating directly inside the selected region.
+    Draw,
     /// Painting DeepSeek-translated text lines directly over the OCR bounding boxes inside the selection.
     InPlaceTranslate,
     /// Streaming AI answer below the toolbar.
@@ -122,6 +125,11 @@ pub struct OverlaySessionState {
     pub ai_markdown_response: String,
     pub is_loading: bool,
     pub status_message: Option<String>,
+    pub annotations: Vec<Annotation>,
+    pub active_annotation: Option<Annotation>,
+    pub draw_tool: DrawTool,
+    pub draw_color: u32,
+    pub draw_stroke_width: f32,
 }
 
 impl Default for OverlaySessionState {
@@ -138,6 +146,11 @@ impl Default for OverlaySessionState {
             ai_markdown_response: String::new(),
             is_loading: false,
             status_message: None,
+            annotations: Vec::new(),
+            active_annotation: None,
+            draw_tool: DrawTool::Pen,
+            draw_color: DRAW_COLOR_PRESETS[0],
+            draw_stroke_width: 4.0,
         }
     }
 }

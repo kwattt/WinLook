@@ -1,3 +1,4 @@
+use crate::annotations::{Annotation, composite_annotations};
 use crate::config::AppConfig;
 use anyhow::{Context, Result};
 use arboard::{Clipboard, ImageData};
@@ -316,6 +317,17 @@ impl CapturedFrame {
         DynamicImage::ImageRgba8(img)
     }
 
+    /// Crops a sub-region and composites any drawn `annotations` onto the cropped image.
+    pub fn crop_with_annotations(&self, rect: ScreenRect, annotations: &[Annotation]) -> DynamicImage {
+        let mut img = self.crop(rect);
+        if !annotations.is_empty() {
+            if let Some(rgba) = img.as_mut_rgba8() {
+                composite_annotations(rgba, (rect.x, rect.y), self.scale_factor, annotations);
+            }
+        }
+        img
+    }
+
     /// Encodes a cropped region as PNG bytes for `Windows.Media.Ocr`, returning `(png_bytes, upscale_factor)`.
     /// Automatically upscales small selections 2x so `Windows.Media.Ocr` accurately recognizes dense Japanese/CJK characters.
     pub fn encode_crop_png_for_ocr(&self, rect: ScreenRect) -> Result<(Vec<u8>, f32)> {
@@ -347,7 +359,17 @@ impl CapturedFrame {
     /// Encodes a cropped region as a Base64 WebP data URL (`data:image/webp;base64,...`)
     /// downscaled to at most `max_edge` (default 1280px) for fast DeepSeek Vision requests.
     pub fn crop_to_vision_data_url(&self, rect: ScreenRect, max_edge: u32) -> Result<String> {
-        let cropped = self.crop(rect);
+        self.crop_to_vision_data_url_with_annotations(rect, max_edge, &[])
+    }
+
+    /// Encodes a cropped region with composited annotations as a Base64 WebP data URL.
+    pub fn crop_to_vision_data_url_with_annotations(
+        &self,
+        rect: ScreenRect,
+        max_edge: u32,
+        annotations: &[Annotation],
+    ) -> Result<String> {
+        let cropped = self.crop_with_annotations(rect, annotations);
         let resized = if cropped.width() > max_edge || cropped.height() > max_edge {
             cropped.resize(max_edge, max_edge, image::imageops::FilterType::Lanczos3)
         } else {
@@ -365,7 +387,16 @@ impl CapturedFrame {
 
     /// Encodes a cropped region as JPEG bytes for Google Lens upload.
     pub fn crop_to_jpeg_bytes(&self, rect: ScreenRect) -> Result<Vec<u8>> {
-        let cropped = self.crop(rect);
+        self.crop_to_jpeg_bytes_with_annotations(rect, &[])
+    }
+
+    /// Encodes a cropped region with composited annotations as JPEG bytes for Google Lens upload.
+    pub fn crop_to_jpeg_bytes_with_annotations(
+        &self,
+        rect: ScreenRect,
+        annotations: &[Annotation],
+    ) -> Result<Vec<u8>> {
+        let cropped = self.crop_with_annotations(rect, annotations);
         let mut buf = Cursor::new(Vec::new());
         cropped
             .write_to(&mut buf, ImageFormat::Jpeg)
@@ -375,7 +406,16 @@ impl CapturedFrame {
 
     /// Copies the cropped region image directly to the Windows clipboard.
     pub fn copy_crop_to_clipboard(&self, rect: ScreenRect) -> Result<()> {
-        let cropped = self.crop(rect).into_rgba8();
+        self.copy_crop_to_clipboard_with_annotations(rect, &[])
+    }
+
+    /// Copies the cropped region image (with composited annotations) directly to the Windows clipboard.
+    pub fn copy_crop_to_clipboard_with_annotations(
+        &self,
+        rect: ScreenRect,
+        annotations: &[Annotation],
+    ) -> Result<()> {
+        let cropped = self.crop_with_annotations(rect, annotations).into_rgba8();
         let width = cropped.width() as usize;
         let height = cropped.height() as usize;
         let bytes = cropped.into_raw();
@@ -394,6 +434,17 @@ impl CapturedFrame {
     /// Saves the cropped region as a PNG screenshot in the configured screenshots directory,
     /// and optionally copies it to the Windows clipboard.
     pub fn save_crop_to_disk(&self, rect: ScreenRect, config: &AppConfig) -> Result<PathBuf> {
+        self.save_crop_to_disk_with_annotations(rect, config, &[])
+    }
+
+    /// Saves the cropped region (with composited annotations) as a PNG screenshot in the configured
+    /// screenshots directory, and optionally copies it to the Windows clipboard.
+    pub fn save_crop_to_disk_with_annotations(
+        &self,
+        rect: ScreenRect,
+        config: &AppConfig,
+        annotations: &[Annotation],
+    ) -> Result<PathBuf> {
         let dir = config.ensure_screenshots_dir()?;
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -402,13 +453,13 @@ impl CapturedFrame {
         let filename = format!("WinLook_{}_{}x{}.png", secs, rect.width, rect.height);
         let path = dir.join(filename);
 
-        let cropped = self.crop(rect);
+        let cropped = self.crop_with_annotations(rect, annotations);
         cropped
             .save_with_format(&path, ImageFormat::Png)
             .with_context(|| format!("Failed to save screenshot to {}", path.display()))?;
 
         if config.auto_copy_on_save {
-            let _ = self.copy_crop_to_clipboard(rect);
+            let _ = self.copy_crop_to_clipboard_with_annotations(rect, annotations);
         }
 
         Ok(path)

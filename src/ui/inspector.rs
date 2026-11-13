@@ -1,8 +1,9 @@
+use crate::annotations::{DRAW_COLOR_PRESETS, DrawTool, STROKE_WIDTH_PRESETS};
 use crate::capture::{ScreenRect, copy_text_to_clipboard};
 use crate::ui::overlay::OverlayView;
 use crate::ui::{
-    BG_INPUT, BG_SURFACE, BG_WINDOW, BORDER_LINE, OverlayMode, TEXT_DIM, TEXT_MAIN, TEXT_SUB,
-    icon_btn, tool_btn,
+    BG_INPUT, BG_SURFACE, BG_WINDOW, BORDER_FOCUS, BORDER_LINE, OverlayMode, TEXT_DIM, TEXT_MAIN,
+    TEXT_SUB, icon_btn, tool_btn,
 };
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -88,16 +89,26 @@ pub fn render_floating_inspector(
     let has_ai_key = crate::config::AppConfig::has_deepseek_api_key();
     let reasoning_on = view.config.enable_ai_reasoning;
 
-    let dock_width = if has_ai_key { 640.0_f32 } else { 360.0_f32 };
+    let is_draw_mode = view.state.mode == OverlayMode::Draw;
+    let dock_width = if has_ai_key {
+        690.0_f32
+    } else if is_draw_mode {
+        530.0_f32
+    } else {
+        415.0_f32
+    };
 
     let has_ai_drawer = view.state.mode == OverlayMode::AskDeepSeek
         && (!view.state.ai_markdown_response.is_empty() || view.state.is_loading);
-    let show_ocr_drawer = view.state.show_ocr_panel && has_ocr_text && !has_ai_drawer;
+    let show_ocr_drawer =
+        view.state.show_ocr_panel && has_ocr_text && !has_ai_drawer && !is_draw_mode;
 
     let needed_height = if has_ai_drawer {
         280.0
     } else if show_ocr_drawer {
         175.0
+    } else if is_draw_mode {
+        88.0
     } else {
         44.0
     };
@@ -169,6 +180,20 @@ pub fn render_floating_inspector(
                                 this.trigger_google_lens_and_close(window, cx);
                             }),
                         ))
+                        .child(tool_btn(
+                            "tb-draw-mode",
+                            None,
+                            "Draw",
+                            is_draw_mode,
+                            cx.listener(|this, _, _, cx| {
+                                if this.state.mode == OverlayMode::Draw {
+                                    this.state.mode = OverlayMode::RegionSelect;
+                                } else {
+                                    this.state.mode = OverlayMode::Draw;
+                                }
+                                cx.notify();
+                            }),
+                        ))
                         .when(has_ocr_text, |bar| {
                             bar.child(tool_btn(
                                 "tb-translate",
@@ -228,6 +253,105 @@ pub fn render_floating_inspector(
                                 ))
                         }),
                 )
+                // ============================================================
+                // 1b. DRAWING SUB-TOOLBAR (SHOWN WHEN DRAW MODE IS ACTIVE)
+                // ============================================================
+                .when(is_draw_mode, |stack| {
+                    let active_tool = view.state.draw_tool;
+                    let active_color = view.state.draw_color;
+                    let active_stroke = view.state.draw_stroke_width;
+                    let has_annotations = !view.state.annotations.is_empty();
+
+                    stack.child(
+                        h_flex()
+                            .gap_1()
+                            .p_1()
+                            .rounded(px(4.0))
+                            .bg(rgb(BG_SURFACE))
+                            .border_1()
+                            .border_color(rgb(BORDER_LINE))
+                            .items_center()
+                            .children(DrawTool::ALL.iter().copied().map(|tool| {
+                                tool_btn(
+                                    ("draw-tool", tool as usize),
+                                    None,
+                                    tool.label(),
+                                    active_tool == tool,
+                                    cx.listener(move |this, _, _, cx| {
+                                        this.state.draw_tool = tool;
+                                        cx.notify();
+                                    }),
+                                )
+                            }))
+                            .child(div().w(px(1.0)).h(px(18.0)).mx_0p5().bg(rgb(BORDER_LINE)))
+                            .children(DRAW_COLOR_PRESETS.iter().copied().enumerate().map(
+                                |(idx, color_hex)| {
+                                    let is_selected = active_color == color_hex;
+                                    div()
+                                        .id(("draw-color", idx))
+                                        .cursor_pointer()
+                                        .w(px(16.0))
+                                        .h(px(16.0))
+                                        .rounded(px(3.0))
+                                        .bg(rgb(color_hex))
+                                        .border_1()
+                                        .border_color(rgb(if is_selected {
+                                            TEXT_MAIN
+                                        } else {
+                                            BORDER_LINE
+                                        }))
+                                        .hover(|h| h.border_color(rgb(BORDER_FOCUS)))
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.draw_color = color_hex;
+                                            cx.notify();
+                                        }))
+                                },
+                            ))
+                            .child(div().w(px(1.0)).h(px(18.0)).mx_0p5().bg(rgb(BORDER_LINE)))
+                            .children(STROKE_WIDTH_PRESETS.iter().copied().enumerate().map(
+                                |(idx, (label, width))| {
+                                    let is_selected = (active_stroke - width).abs() < 0.1;
+                                    tool_btn(
+                                        ("draw-stroke", idx),
+                                        None,
+                                        label,
+                                        is_selected,
+                                        cx.listener(move |this, _, _, cx| {
+                                            this.state.draw_stroke_width = width;
+                                            cx.notify();
+                                        }),
+                                    )
+                                },
+                            ))
+                            .child(div().w(px(1.0)).h(px(18.0)).mx_0p5().bg(rgb(BORDER_LINE)))
+                            .child(icon_btn(
+                                "draw-undo-btn",
+                                IconName::Undo2,
+                                cx.listener(move |this, _, _, cx| {
+                                    if has_annotations {
+                                        this.state.annotations.pop();
+                                        cx.notify();
+                                    }
+                                }),
+                            ))
+                            .child(tool_btn(
+                                "draw-clear-btn",
+                                None,
+                                "Clear",
+                                false,
+                                cx.listener(move |this, _, _, cx| {
+                                    if has_annotations {
+                                        this.state.annotations.clear();
+                                        this.state.active_annotation = None;
+                                        cx.notify();
+                                    }
+                                }),
+                            )),
+                    )
+                })
                 // ============================================================
                 // 2. AUTO-OCR PANEL (APPEARS AUTOMATICALLY WHEN TEXT IS IN REGION)
                 // ============================================================
